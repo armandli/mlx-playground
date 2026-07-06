@@ -2,5 +2,5 @@
 
 | Skill Name | Uses | Issues |
 |---|---|---|
-| create-skill | 1 | 0 |
+| create-skill | 2 | 0 |
 
