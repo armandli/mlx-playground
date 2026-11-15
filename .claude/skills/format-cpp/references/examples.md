@@ -318,11 +318,11 @@ private:
 
 // AFTER
 struct Widget {
-  Widget(int v) : value_(v) {}
-  int get() const { return value_; }
+  Widget(int v) : mValue(v) {}
+  int get() const { return mValue; }
 
 private:
-  int value_;
+  int mValue;
 };
 ```
 
@@ -354,7 +354,7 @@ protected:
   void helper();
 
 private:
-  int state_;
+  int mState;
 };
 ```
 
@@ -380,7 +380,7 @@ protected:
   void internal_method();
 
 private:
-  int data_;
+  int mData;
 };
 ```
 
@@ -421,16 +421,16 @@ double Point::distance_to(Point const& other) const {
 
 // AFTER
 struct Point {
-  int x() const { return x_; }
-  int y() const { return y_; }
+  int x() const { return mX; }
+  int y() const { return mY; }
   double distance_to(Point const& other) const {
-    auto dx = x_ - other.x_;
-    auto dy = y_ - other.y_;
+    auto dx = mX - other.mX;
+    auto dy = mY - other.mY;
     return std::sqrt(dx * dx + dy * dy);
   }
 
 private:
-  int x_, y_;
+  int mX, mY;
 };
 ```
 
@@ -486,6 +486,82 @@ enum OldStyle { A, B, C };
 // AFTER
 enum OldStyle : int { A, B, C };
 ```
+
+### E7 — `inline` only where linkage requires it
+
+**Redundant — removed:**
+```cpp
+// BEFORE (in a header)
+struct Counter {
+  inline int value() const { return mValue; }       // defined in the body: already inline
+  static constexpr inline int kMax = 100;           // static constexpr member: already inline (C++17)
+
+private:
+  int mValue = 0;
+};
+
+inline constexpr int clamp_count(int n) {           // constexpr function: already inline
+  return n > Counter::kMax ? Counter::kMax : n;
+}
+
+template<typename T>
+inline T twice(T v) { return v + v; }               // template: already exempt
+
+// AFTER
+struct Counter {
+  int value() const { return mValue; }
+  static constexpr int kMax = 100;
+
+private:
+  int mValue = 0;
+};
+
+constexpr int clamp_count(int n) {
+  return n > Counter::kMax ? Counter::kMax : n;
+}
+
+template<typename T>
+T twice(T v) { return v + v; }
+```
+
+**In a `.cpp` file — removed, and file-local helpers moved to an anonymous namespace:**
+```cpp
+// BEFORE (parser.cpp; is_digit is not declared in any header)
+inline bool is_digit(char c) { return c >= '0' and c <= '9'; }
+
+// AFTER
+namespace {
+
+bool is_digit(char c) { return c >= '0' and c <= '9'; }
+
+}  // namespace
+```
+
+**Required — kept:**
+```cpp
+// router_common.h, included by several .cpp files
+inline std::string shell_quote(std::string_view s) {       // non-template function defined in a header
+  return "'" + std::string(s) + "'";
+}
+
+inline int gRequestCount = 0;                              // header-defined variable (C++17)
+
+struct Path {
+  std::string str() const;
+
+private:
+  std::string mText;
+};
+inline std::string Path::str() const { return mText; }     // out-of-class member definition in a header
+
+template<typename T> std::string describe(const T&);
+template<> inline std::string describe(const int& v) {     // explicit specialization in a header
+  return "int " + std::to_string(v);
+}
+```
+
+Dropping any of these makes the second `.cpp` file that includes the header fail to link with
+"multiple definition of ...". Adding `inline` to make code faster is never a reason to keep it.
 
 ---
 
@@ -757,6 +833,423 @@ Widget* create_widget() {
 // Suggest: std::unique_ptr<Widget> create_widget()
 ```
 
+### G4 — No in-out parameters
+
+**Position advanced through a reference → returned in a named struct:**
+```cpp
+// BEFORE
+// On success advances pos; on error returns nullopt and leaves pos unchanged.
+std::optional<char32_t> decode_utf8(std::string_view s, std::size_t& pos);
+
+std::size_t count_code_points(std::string_view s) {
+  std::size_t count = 0;
+  std::size_t pos = 0;
+  while (pos < s.size()) {
+    if (not decode_utf8(s, pos).has_value()) break;
+    ++count;
+  }
+  return count;
+}
+
+// AFTER
+struct DecodedCodePoint {
+  char32_t code_point;
+  std::size_t next;
+};
+
+std::optional<DecodedCodePoint> decode_utf8(std::string_view s, std::size_t pos);
+
+std::size_t count_code_points(std::string_view s) {
+  std::size_t count = 0;
+  std::size_t pos = 0;
+  while (pos < s.size()) {
+    std::optional<DecodedCodePoint> d = decode_utf8(s, pos);
+    if (not d.has_value()) break;
+    pos = d->next;
+    ++count;
+  }
+  return count;
+}
+```
+
+**Value read and overwritten → returned:**
+```cpp
+// BEFORE
+void clamp_width(int& width) {
+  if (width > 80) width = 80;
+}
+clamp_width(w);
+
+// AFTER
+int clamp_width(int width) {
+  return width > 80 ? 80 : width;
+}
+w = clamp_width(w);
+```
+
+**Exception — in-place mutation is the purpose (NOT converted):**
+```cpp
+// Keep as-is: the function exists to modify the buffer, and copying it would be costly
+void apply(const Edit& edit, std::string& buffer);
+void sort_entries(std::vector<Entry>& entries);
+std::ostream& operator<<(std::ostream& os, const Widget& w);
+```
+
+### G5 — Shared language helpers
+
+**Local `overloaded` copy → `util::Overloaded` from `<util/language.h>`:**
+```cpp
+// BEFORE (src/ai/events.cpp)
+#include <ai/events.h>
+
+namespace pi::ai {
+
+// TODO refactor to util and share
+namespace {
+template <typename... Ts> struct overloaded : Ts... { using Ts::operator()...; };
+}  // namespace
+
+strv event_type(const AssistantMessageEvent& event) {
+  return s::visit(overloaded{
+    [](const StartEvent&) -> strv { return "start"; },
+    [](const DoneEvent&)  -> strv { return "done"; },
+    [](const auto&)       -> strv { return "other"; },
+  }, event);
+}
+
+}  // namespace pi::ai
+
+// AFTER
+#include <ai/events.h>
+
+#include <util/language.h>
+
+namespace pi::ai {
+
+strv event_type(const AssistantMessageEvent& event) {
+  return s::visit(util::Overloaded{
+    [](const StartEvent&) -> strv { return "start"; },
+    [](const DoneEvent&)  -> strv { return "done"; },
+    [](const auto&)       -> strv { return "other"; },
+  }, event);
+}
+
+}  // namespace pi::ai
+```
+
+**Helper repeated in several files but missing from the header → moved into it:**
+```cpp
+// BEFORE: the same template in a.cpp and b.cpp
+template <typename> inline constexpr bool always_false = false;
+
+// AFTER: once, in src/util/language.h (namespace pi::util), with a usage line
+// For static_assert in the last `if constexpr` branch of a visitor:
+//   else static_assert(util::ALWAYS_FALSE<T>, "unhandled alternative");
+template <typename> inline constexpr bool ALWAYS_FALSE = false;
+```
+Renamed by H4 (a namespace-scope constant). `inline` stays, per E7: it is a variable defined in a header. Add a row for it to the G5 table in SKILL.md.
+
+---
+
+## Group H: Naming Conventions
+
+### H1 — Function names: `lower_snake_case`
+
+```cpp
+// BEFORE
+void ParseInput();
+int GetValue();
+void computeTotal();
+
+// AFTER
+void parse_input();
+int get_value();
+void compute_total();
+```
+
+**Exception — constructors, destructors, and operator overloads (NOT renamed):**
+```cpp
+// Keep as-is: name is fixed by the language
+struct Widget {
+  Widget();
+  ~Widget();
+  Widget operator+(const Widget& other) const;
+};
+```
+
+### H2 — Class names: `UpperCamelCase`, abbreviated when too long
+
+```cpp
+// BEFORE
+struct http_request {};
+struct jsonParser {};
+
+// AFTER
+struct HttpRequest {};
+struct JsonParser {};
+```
+
+**Abbreviation when the name exceeds ~24 characters:**
+```cpp
+// BEFORE — 28 characters, "UniformResourceLocator" abbreviates to "URL"
+// (not pronounceable as a word, so it stays all capitals)
+struct UniformResourceLocatorParser {};
+
+// AFTER
+struct URLParser {};
+```
+
+```cpp
+// BEFORE — 31 characters, "JavaScriptObjectNotation" abbreviates to "JSON"
+// (pronounceable as a word, so it's treated like any other word: only the
+// first letter is capitalized)
+struct JavaScriptObjectNotationParser {};
+
+// AFTER
+struct JsonParser {};
+```
+
+**Exception — short names are left as-is:**
+```cpp
+// Keep as-is: already under ~24 characters, even though "Identifier" has a
+// common abbreviation
+struct UserIdentifier {};
+```
+
+### H3 — Member variables: `mUpperCamelCase`
+
+```cpp
+// BEFORE
+struct Session {
+  Session(std::string id) : session_id_(std::move(id)) {}
+
+  const std::string& id() const { return session_id_; }
+  void retry() { ++m_retry_count; }
+
+protected:
+  std::string session_id_;
+  int m_retry_count = 0;
+  UrlParser url_parser_;
+};
+
+// AFTER
+struct Session {
+  Session(std::string id) : mSessionId(std::move(id)) {}
+
+  const std::string& id() const { return mSessionId; }
+  void retry() { ++mRetryCount; }
+
+protected:
+  std::string mSessionId;
+  int mRetryCount = 0;
+  UrlParser mUrlParser;   // not mURLParser — abbreviations stay plain here
+};
+```
+
+Note that the member-initializer list and both method bodies were updated along
+with the declarations. Missing one of those is the usual way this rule breaks a
+build.
+
+**Exception — public data members are left as-is:**
+```cpp
+// Keep as-is: no access specifier, so these are public (E1 prefers struct).
+// A plain data carrier reads worse with the prefix, and renaming churns every
+// call site.
+struct ToolResult {
+  bool ok = false;
+  std::string output;
+  std::string error;
+};
+```
+
+### H4 — Namespace-scope variables: `UPPER_SNAKE_CASE` constants, `UpperCamelCase` mutables
+
+```cpp
+// BEFORE
+namespace jfsh {
+namespace {
+constexpr double kLambda = 0.95;
+const SigEntry kSigNames[] = {{"INT", SIGINT}, {"TERM", SIGTERM}};
+const char* default_prompt = "%~ %# ";
+std::unordered_map<std::string, int> name_map;
+}  // namespace
+
+int lookup(std::string_view name) {
+  constexpr std::string_view kPrefix = "SIG";  // function-local: not renamed
+  // ... uses kLambda, kSigNames, default_prompt, name_map
+}
+}  // namespace jfsh
+
+// AFTER
+namespace jfsh {
+namespace {
+constexpr double LAMBDA = 0.95;
+const SigEntry SIG_NAMES[] = {{"INT", SIGINT}, {"TERM", SIGTERM}};
+const char* DefaultPrompt = "%~ %# ";  // pointer is mutable, so not a constant
+std::unordered_map<std::string, int> NameMap;
+}  // namespace
+
+int lookup(std::string_view name) {
+  constexpr std::string_view kPrefix = "SIG";
+  // ... uses LAMBDA, SIG_NAMES, DefaultPrompt, NameMap
+}
+}  // namespace jfsh
+```
+
+**Across translation units — rename the `extern` declaration and every use:**
+```cpp
+// options.h, BEFORE                      // options.h, AFTER
+extern const OptionInfo kOptionInfo[];    extern const OptionInfo OPTION_INFO[];
+// options.cpp and every file that uses it are updated to OPTION_INFO as well.
+```
+
+**Exception — skip a rename that collides with a macro:**
+```cpp
+// Keep as-is: renaming to EOF would be replaced by the <cstdio> macro.
+constexpr int kEof = -1;
+```
+
+**Exception — static members keep their convention:**
+```cpp
+struct Registry {
+protected:
+  int mLiveCount = 0;                          // renamed
+  static constexpr int kMaxEntries = 512;      // left alone
+  static Registry* sInstance;                  // left alone
+};
+```
+
+---
+
+## Group I: Comments
+
+### I1 — Delete comments the code already says
+
+```cpp
+// BEFORE
+// Constructs a Widget.
+Widget::Widget(std::string name) : mName(std::move(name)) {}
+
+// Returns the name.
+const std::string& Widget::name() const { return mName; }
+
+// Loop over the items and total them up.
+int total = 0;
+for (const Item& item : items) {
+  total += item.value;  // add this item's value to the total
+}
+
+// AFTER
+Widget::Widget(std::string name) : mName(std::move(name)) {}
+
+const std::string& Widget::name() const { return mName; }
+
+int total = 0;
+for (const Item& item : items) {
+  total += item.value;
+}
+```
+
+### I2 — What a comment is for
+
+**Magic number:**
+```cpp
+// BEFORE
+if (is_binary(head.substr(0, 8192))) return Rendering::Unsupported;
+
+// AFTER
+// 8192: a NUL in any real text file lands well inside the first block.
+if (is_binary(head.substr(0, 8192))) return Rendering::Unsupported;
+```
+
+**Composed formula:**
+```cpp
+// Wilson score lower bound at 95%: mean shifted by z^2/2n, over the
+// z-widened denominator. Not the plain proportion.
+const double score = (p + z * z / (2 * n) - z * std::sqrt(p * (1 - p) / n)) /
+                     (1 + z * z / n);
+```
+
+**Condition deliberately left unchecked:**
+```cpp
+// Non-null: every caller checks in_repo() first.
+git_repository_workdir(mRepo);
+```
+
+**Assumption about input:**
+```cpp
+// `head` is the first few KB, not the whole file — callers must not
+// pass a multi-megabyte string here.
+bool is_binary(std::string_view head);
+```
+
+**Assumption about output:**
+```cpp
+// Borrows from `args`; valid only as long as it is.
+const std::vector<Edit>* edits_arg(const ToolArgs& args);
+```
+
+**Non-obvious optimization:**
+```cpp
+// Skips the whole subtree rather than filtering its entries, which is
+// what makes a large build/ free instead of merely excluded.
+if (filter.ignored(path, is_directory)) it.disable_recursion_pending();
+```
+
+**Why, not what — the same line, both ways:**
+```cpp
+// BEFORE
+// Truncate the file and write the new notes.
+std::ofstream out(kMemoryPath, std::ios::trunc);
+
+// AFTER
+// Overwrite rather than append: the notes are already in the prompt each
+// turn, so the file can't grow without bound.
+std::ofstream out(kMemoryPath, std::ios::trunc);
+```
+
+The code shows the truncation either way. Only the second comment says something the reader couldn't have worked out.
+
+### I3 — Brief, and only what's missing
+
+A comment that qualifies under I2 but runs long is condensed in place — the fact stays, the narration goes.
+
+```cpp
+// BEFORE
+// This function walks the directory tree starting at the given root. It
+// uses a recursive_directory_iterator, and for each entry it encounters
+// it asks the IgnoreFilter whether the path should be skipped. If the
+// entry is a directory and it is ignored, we call
+// disable_recursion_pending so that the iterator does not descend into
+// it. Otherwise, if the entry is a regular file, we compute its path
+// relative to the root and push it onto the results vector, which is
+// then returned to the caller.
+std::vector<std::string> walk_files(const std::filesystem::path& root, ...);
+
+// AFTER
+// Paths relative to `root`, in iteration order. Ignored directories are
+// never descended into, so a large build/ costs nothing.
+std::vector<std::string> walk_files(const std::filesystem::path& root, ...);
+```
+
+### Exceptions — left untouched
+
+```cpp
+#ifndef TOOLS_UTIL_H     // C1 requires the guard
+#define TOOLS_UTIL_H
+
+namespace agent {
+
+// TODO(#412): drop once the v2 endpoint ships.
+std::string legacy_path();
+
+int parse(const char* text);  // NOLINT(readability-identifier-naming)
+
+}  // namespace agent      <- D3 requires this closing comment
+
+#endif  // TOOLS_UTIL_H    <- C1 requires this one
+```
+
 ---
 
 ## Compound Example: Multiple Rules Interacting (C++17 project)
@@ -814,7 +1307,7 @@ namespace my_project::core {
 
 template<typename T>
 struct Processor {
-  Processor(std::string_view name) : name_(name) {}
+  Processor(std::string_view name) : mName(name) {}
 
   std::optional<T> process(std::string_view input) {
     if (input.empty() or not validate(input)) {
@@ -827,7 +1320,7 @@ protected:
   bool validate(std::string_view s) { return not s.empty(); }
 
 private:
-  std::string name_;
+  std::string mName;
 };
 
 }  // namespace my_project::core
@@ -851,8 +1344,9 @@ private:
 - F4: `||` -> `or`, `!` -> `not`
 - G1: `const string&` -> `string_view` (input is read-only so converted)
 - G3: `T*` return -> `std::optional<T>` (not polymorphic, not ownership — was `new`, but result is a value type once fixed)
+- H3: `name_` -> `mName`
 
-Note: `name_` parameter stays `std::string_view` even though it's stored in a `std::string` member — the conversion from `string_view` to `string` happens implicitly in the initializer list, which is safe and efficient.
+Note: the `name` parameter stays `std::string_view` even though it's stored in a `std::string` member — the conversion from `string_view` to `string` happens implicitly in the initializer list, which is safe and efficient.
 
 ## Compound Example: Pre-C++17 Project
 

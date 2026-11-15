@@ -1,6 +1,6 @@
 ---
 name: format-cpp
-description: Formats C++ code according to 21 specific style rules covering whitespace, braces, preprocessor directives, namespaces, types, formatting, and semantic transformations. Use when user asks to "format my C++ code", "apply C++ style rules", "clean up this C++ file", or "run format-cpp on X". Run refactor-cpp before this skill. Do NOT use for explaining C++ code, debugging, or writing new C++ code from scratch.
+description: Formats C++ code according to 34 specific style rules covering whitespace, braces, preprocessor directives, namespaces, types, formatting, semantic transformations, naming conventions, and comments. Use when user asks to "format my C++ code", "apply C++ style rules", "clean up this C++ file", or "run format-cpp on X". Run refactor-cpp before this skill. Do NOT use for explaining C++ code, debugging, or writing new C++ code from scratch.
 argument-hint: "[file or directory path]"
 ---
 
@@ -24,7 +24,7 @@ Rules D3, G1, and G3 require C++17 or later. If the project targets C++14 or ear
 
 ### Step 2: Format Each File
 
-Apply rule groups A through G in order. For each file:
+Apply rule groups A through H in order. For each file:
 
 1. Read the file completely
 2. Apply all applicable rules (see below)
@@ -98,7 +98,7 @@ Remove duplicate includes.
 
 **D1 — No global `using namespace`.** Remove any `using namespace X;` at file/namespace scope. Replace affected unqualified names with qualified names or namespace aliases.
 
-**D2 — Namespace aliases.** When removing `using namespace` or when a qualified name like `std::chrono::seconds` appears 3+ times, introduce a short alias near the top of the function or file scope. Use the predefined alias mapping in [references/namespace-aliases.md](references/namespace-aliases.md).
+**D2 — Namespace aliases.** When removing `using namespace` or when a qualified name like `std::chrono::seconds` appears 3+ times, introduce a short alias near the top of the function or file scope. Use the predefined alias mapping in [references/namespace-aliases.md](references/namespace-aliases.md). If the project has a shared alias header (in this repo, `src/util/aliases.h`), `#include <util/aliases.h>` and use its namespace and type aliases (`s::`, `str`, `strv`, `vec<>`, `opt<>`, `umap<>`, ...) instead of declaring local aliases; declare a local alias only for a namespace the header does not cover. A local variable or parameter that shares an alias's name (`s`, `st`, `str`, ...) shadows it, so rename the variable first (e.g. `s` → `text`).
 
 **D3 — Nested namespace syntax. (C++17)** When namespace blocks are nested, collapse them into a single declaration using `namespace A::B::C {`. Apply this to all consecutive nested namespaces. Add a closing comment reflecting the full path: `}  // namespace A::B::C`. Skip this rule if the project targets C++14 or earlier.
 
@@ -116,9 +116,14 @@ template<typename T>   // yes
 template<class T>      // no
 ```
 
-**E5 — Inline small methods.** Methods with 3 or fewer statements should be defined inline in the struct/class body. Move longer methods out-of-line.
+**E5 — Inline small methods.** Methods with 3 or fewer statements should be defined inline in the struct/class body. Move longer methods out-of-line. A method defined in the body is implicitly inline: do not write the `inline` keyword (E7).
 
 **E6 — Enum underlying type.** Every `enum class`, `enum struct`, and plain `enum` declaration must include an explicit underlying fundamental type. If none is specified, add `: int` as the default. Only use a type other than `int` when the enum values demonstrably require it (e.g., a flags enum needing more than 32 bits uses `: uint64_t`, an enum that must fit in a byte uses `: uint8_t`). If the declaration already has an explicit underlying type, leave it unchanged.
+
+**E7 — `inline` only where linkage requires it.** `inline` means "this definition may appear in several translation units", not "make this faster": compilers inline whatever their heuristics choose, with or without the keyword. Never add it as a performance hint.
+- **Remove** it where it is redundant: member functions defined inside the class body, `constexpr`/`consteval` functions, function templates, and `static constexpr` data members (C++17) are already inline.
+- **Remove** it from functions defined in a `.cpp` file. If such a function is used only in that file and is not declared in any header, also move it into an anonymous namespace (or make it `static`).
+- **Keep** it on non-template functions and variables defined in a header, on member functions defined outside the class body but still in a header, and on explicit specializations of function templates defined in a header. Removing it there causes "multiple definition" link errors as soon as two `.cpp` files include the header.
 
 ### Group F: Formatting
 
@@ -153,6 +158,167 @@ Also convert local `const std::string` variables that are only read to `std::str
 
 Add `#include <optional>` if not already present.
 
+**G4 — No in-out parameters.** A function parameter must not be used as both input and output. That means a non-const reference or pointer parameter whose incoming value the function reads and also overwrites, like `pos` in `decode(std::string_view s, size_t& pos)`. Callers then can't pass a `const` value or a temporary, and can't look ahead without making a copy. Convert it:
+- Take the input by value (or `const&` / `std::string_view` for large types) and leave it unmodified.
+- Return the new value. When the function already returns something, return a small named aggregate `struct` holding both, e.g. `struct DecodedCodePoint { char32_t code_point; std::size_t next; };`. Prefer this over `std::pair` / `std::tuple`, because named fields say what each value is.
+- When the function can fail, wrap the result in `std::optional<...>` (G3) instead of leaving the parameter "unchanged on error".
+- Update every caller: `x = f(..., x)` / `x = r->next`. For loops that advanced the parameter, assign it from the result.
+
+**Exceptions — do NOT convert when:**
+- The function's purpose is to modify the object in place: mutating algorithms such as `sort(std::vector<T>&)` or `apply(Buffer&)`, `swap`, compound-assignment operators (`+=`), and stream parameters (`std::ostream&`, `std::istream&`).
+- Copying the object to return it would be expensive: large containers or buffers modified in place, especially in hot loops.
+- The signature is fixed externally: `virtual` / `override`, `extern "C"`, callbacks matching a library-defined type, or third-party code.
+- The parameter is output-only (its incoming value is never read). That is not an in-out parameter; leave it unless it is trivially returnable.
+
+**G5 — Shared language helpers.** Generic core-language helpers, those that work on any type rather than on one module's data, are defined once in the project's language utility header and never copied into individual files. In this repo that header is `src/util/language.h` (namespace `pi::util`). It holds:
+
+| Helper | Use | Replaces |
+|---|---|---|
+| `util::Overloaded{...}` | one visitor out of several lambdas for `s::visit` | a local `template <typename... Ts> struct overloaded : Ts... { using Ts::operator()...; };` |
+
+- **Replace local copies.** Delete a file's own definition of a helper the header already provides, including the anonymous namespace that existed only to hold it and any `TODO` about sharing it. `#include <util/language.h>` (C2: project headers group) and qualify uses as `util::Overloaded` inside `pi::` namespaces, or `pi::util::Overloaded` outside them.
+- **Grow the header, don't fork it.** If a helper of this kind is defined in two or more files and is not in the header yet, move it there: name it by H1/H2/H4 (`overloaded` → `Overloaded`, `always_false` → `ALWAYS_FALSE`), give it a one-line usage comment, delete the copies, and add a row to the table above. A helper used in only one file stays where it is (refactor-cpp extracts only repeated code).
+- **What belongs there.** Helpers about the language itself: visitor builders, `always_false<T>` for `static_assert` in `if constexpr` branches, scope guards. String, container or numeric helpers go in their own `util/` headers (`util/strings.h`, ...), and namespace and type aliases go in `util/aliases.h` (D2).
+
+**Exceptions — do NOT replace:**
+- A local helper that is not equivalent to the shared one (different members, extra deduction guides, a constraint), unless it is used only in ways the shared one supports.
+- Code the project does not own (third-party, vendored, generated).
+
+### Group H: Naming Conventions
+
+**H1 — Function names: `lower_snake_case`.** Free functions, member functions, and static methods start with a lowercase letter; words are separated by underscores:
+```cpp
+void this_is_a_function();   // yes
+void ParseInput();           // no
+void parseInput();           // no
+```
+**Exceptions — do NOT rename:**
+- Constructors and destructors (name is fixed to the class name by the language)
+- Operator overloads (`operator+`, `operator==`, etc.)
+
+**H2 — Class names: `UpperCamelCase`, abbreviated when too long.** `struct`, `class`, and `enum` names start with a capital letter; each subsequent word also starts with a capital letter, with no separator characters:
+```cpp
+struct ClassConcept {};   // yes
+struct HttpRequest {};    // yes
+struct http_request {};   // no
+struct httpRequest {};    // no
+```
+
+When the full name would exceed roughly 24 characters, shorten one or more of its constituent words to a well-known abbreviation instead of spelling every word out:
+- If the abbreviation cannot be pronounced as a word, write it in ALL CAPITALS: `URL`, `ID`, `DB`.
+- If the abbreviation can be pronounced as a word, treat it like any other word in the name — capitalize only its first letter: `JSON` → `Json`, `HTML` → `Html`.
+
+```cpp
+// too long (28 chars) — "UniformResourceLocator" -> "URL" (not pronounceable, all caps)
+struct UniformResourceLocatorParser {};   // before
+struct URLParser {};                      // after
+
+// too long (31 chars) — "JavaScriptObjectNotation" -> "JSON" (pronounceable, becomes a word)
+struct JavaScriptObjectNotationParser {}; // before
+struct JsonParser {};                     // after
+```
+
+Names at or under ~24 characters are left as-is even if they contain a word that has a common abbreviation.
+
+**H3 — Member variables: `mUpperCamelCase`.** Non-static data members declared under a `private:` or `protected:` access specifier are prefixed with a lowercase `m`, followed by the name in `UpperCamelCase`:
+```cpp
+struct Session {
+protected:
+  std::string mSessionId;      // yes
+  int mRetryCount;             // yes
+  std::string session_id_;     // no
+  int m_retry_count;           // no
+  int mretrycount;             // no
+};
+```
+
+Unlike H2, abbreviations after the `m` are capitalized like ordinary words rather than written in all capitals — `mStateId`, `mUrlParser`, `mDbHandle`, not `mStateID` or `mURLParser`. The `m` is what signals "member", so the rest of the name stays visually plain.
+
+**Exceptions — do NOT rename:**
+- Public data members. Since E1 prefers `struct`, members with no access specifier above them are public and stay as they are — a plain data carrier like `struct ToolResult { bool ok; std::string output; };` reads worse with the prefix, and renaming it churns every call site.
+- Static data members and `static constexpr` constants, which follow their existing convention.
+- Members of types you do not own (third-party headers, generated code).
+
+When applying this rule, update every reference to the renamed member — in particular constructor member-initializer lists, in-class default initializers, and any place the old name appears inside the type's own methods. Because the members are private or protected, all references are within the type itself or its derived types, so the rename is contained; if a member turns out to be reachable from outside (a friend declaration, a macro), skip it and note it.
+
+**H4 — Namespace-scope variables: `UPPER_SNAKE_CASE` constants, `UpperCamelCase` mutables.** A variable declared at namespace scope (the global namespace, a named or anonymous namespace, or file-`static`) is named by whether the variable itself is constant:
+- **Constant** (`constexpr`, or the object itself is `const`): all capital letters, words separated by `_`. No `k` prefix, no lowercase.
+- **Non-constant** global object: `UpperCamelCase`, like a type name (H2), with no separator characters.
+
+```cpp
+constexpr double LAMBDA = 0.95;                    // yes
+const std::size_t MAX_RETRY_COUNT = 3;             // yes
+constexpr std::string_view DATA_PREFIX = "data:";  // yes
+static const SigEntry SIG_NAMES[] = {/* ... */};   // yes
+std::unordered_map<std::string, int> NameMap;      // yes
+std::atomic<bool> InterruptRequested{false};       // yes
+
+constexpr double kLambda = 0.95;                   // no: k prefix
+const std::size_t max_retry_count = 3;             // no: lowercase
+std::unordered_map<std::string, int> name_map;     // no: snake case for a mutable
+std::unordered_map<std::string, int> NAME_MAP;     // no: caps are for constants only
+```
+
+Constness is about the variable, not what it points to: `const char* Greeting = "hi";` is a mutable pointer, so it is `UpperCamelCase`; `const char* const GREETING` and `constexpr const char* GREETING` are constants.
+
+**Exceptions — do NOT rename:**
+- Function-local variables, including `static` locals and local `constexpr` constants (`constexpr std::string_view kPrefix` inside a function body stays as-is). This rule covers namespace scope only.
+- Static data members, which follow H3's exception.
+- `extern "C"` variables, names required by a library or ABI (`environ`, `optarg`), and variables in code you do not own.
+- A rename whose new name collides with a macro (`EOF`, `PATH_MAX`, `SIGINT`), a type, or another identifier in scope. Skip it and note the collision.
+
+When applying this rule, update every use, including `extern` declarations in headers and uses in other translation units. Grep the whole project for the old name, not just the current file.
+
+### Group I: Comments
+
+**I1 — Delete comments the code already says.** Assume a reader who fully understands C++ syntax and the standard library. If that reader would learn nothing from the comment, remove it. Deletion is the default disposition: a comment survives only by falling under I2 or the exceptions below.
+
+```cpp
+// BEFORE
+// Loop over the edits and apply each one.
+for (const Edit& edit : edits) {
+  apply(edit);
+}
+
+// AFTER
+for (const Edit& edit : edits) {
+  apply(edit);
+}
+```
+
+The structural comments other rules require are not prose and are never removed by this rule: `#endif  // GUARD_H` (C1) and `}  // namespace A::B::C` (D3) stay exactly as those rules specify.
+
+**I2 — What a comment is for.** Keep an existing comment, and write a new one, only when it carries one of these:
+
+- a **magic number or literal** whose value isn't self-explaining
+- a **composed formula** — several standard ones combined into something not recognizable at a glance
+- a **condition deliberately left unchecked**, because an upstream guarantee makes it impossible
+- an **assumption about input** — a precondition the signature can't state
+- an **assumption about output** — a postcondition, ownership, lifetime, or invariant
+- a **non-obvious optimization**, and what it buys
+- **why** a decision was made, where the alternative would look equally reasonable
+
+The last one is the widest and the easiest to abuse. It covers the reason behind a choice, never a description of the choice — the code already shows *what* was done.
+
+```cpp
+// Overwrite rather than append: the notes are already in the prompt
+// each turn, so the file can't grow without bound.      <- keep (why)
+void MemoryTool::rewrite(std::string_view notes);
+
+// Rewrites the notes file.                              <- delete (what)
+void MemoryTool::rewrite(std::string_view notes);
+```
+
+**I3 — Brief, and only what's missing.** One or two lines. State the fact the code can't and stop — no restating the surrounding code, no narrating what the next lines will do, no hedging. A comment that qualifies under I2 but runs longer than it needs to is **condensed in place**: keep the fact, drop the prose.
+
+**Exceptions — never removed:**
+- The structural comments named in I1 (`#endif`, closing `namespace`).
+- License and copyright headers.
+- `TODO`, `FIXME`, `HACK`, `NOTE` markers, and anything citing an issue or ticket.
+- Comments in code the project doesn't own — third-party, vendored, or generated.
+- Tool directives such as `// NOLINT` and `// clang-format off` / `on`. These are instructions to other tools, not prose.
+- Commented-out code is outside this rule's scope: report it in Step 4, don't silently delete it.
+
 ---
 
 ## Error Handling
@@ -162,19 +328,11 @@ Add `#include <optional>` if not already present.
 - **Template-heavy code**: Be extra cautious with G1 and G3 in heavily templated code; prefer skipping over breaking
 - **C++17 required**: Rules D3, G1, and G3 require C++17 or later. If the standard cannot be detected, ask the user before applying these rules
 - **Never break compilation**: If applying a rule would introduce a compile error, skip it
+- **`inline` in a `.cpp` file (E7)**: Only move a function into an anonymous namespace when no header declares it and no other file refers to it; if you cannot check every file, just drop the keyword
+- **Callers out of reach (G4)**: If a function with an in-out parameter is called from code you cannot see or update (a public library API, other repositories), skip it and note it in the report rather than breaking those callers
+- **Comment uncertainty**: If you cannot tell whether a comment carries information the code doesn't, keep it. A comment kept in error costs a line; one deleted in error destroys the only record of a decision
 
 ## Additional Resources
 
 - For the predefined namespace alias mapping, see [references/namespace-aliases.md](references/namespace-aliases.md)
 - For before/after examples of every rule, see [references/examples.md](references/examples.md)
-
----
-
-## Final Step — Record Usage
-
-After the skill's primary task completes, run (record both the dependency and this skill):
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "refactor-cpp"
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "format-cpp"
-```
